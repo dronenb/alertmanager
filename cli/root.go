@@ -15,6 +15,7 @@ package cli
 
 import (
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -36,18 +37,33 @@ import (
 	"github.com/prometheus/alertmanager/matcher/compat"
 )
 
-var (
-	verbose         bool
-	alertmanagerURL *url.URL
-	output          string
-	timeout         time.Duration
-	httpConfigFile  string
-	versionCheck    bool
-	featureFlags    string
+type customTransport struct {
+	underlyingTransport http.RoundTripper
+}
 
-	configFiles = []string{os.ExpandEnv("$HOME/.config/amtool/config.yml"), "/etc/amtool/config.yml"}
-	legacyFlags = map[string]string{"comment_required": "require-comment"}
+var (
+	verbose          bool
+	alertmanagerURL  *url.URL
+	output           string
+	timeout          time.Duration
+	httpConfigFile   string
+	versionCheck     bool
+	featureFlags     string
+	globalHttpParams = map[string]string{}
+	configFiles      = []string{os.ExpandEnv("$HOME/.config/amtool/config.yml"), "/etc/amtool/config.yml"}
+	legacyFlags      = map[string]string{"comment_required": "require-comment"}
 )
+
+func (t *customTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Add all global parameters as query strings
+	q := req.URL.Query()
+	for key, value := range globalHttpParams {
+		q.Add(key, value)
+	}
+	req.URL.RawQuery = q.Encode()
+
+	return t.underlyingTransport.RoundTrip(req)
+}
 
 func initMatchersCompat(_ *kingpin.ParseContext) error {
 	promslogConfig := &promslog.Config{Writer: os.Stdout}
@@ -122,7 +138,17 @@ func NewAlertmanagerClient(amURL *url.URL) *client.AlertmanagerAPI {
 		if err != nil {
 			kingpin.Fatalf("failed to create a new HTTP client: %v", err)
 		}
+		// Wrap the HTTP client with customTransport to add global HTTP parameters
+		httpclient.Transport = &customTransport{
+			underlyingTransport: httpclient.Transport,
+		}
 		cr = clientruntime.NewWithClient(address, path.Join(amURL.Path, defaultAmApiv2path), schemes, httpclient)
+	} else {
+		// Wrap the default HTTP client with customTransport to add global HTTP parameters
+		httpClient := cr.Transport.(*http.Transport)
+		cr.Transport = &customTransport{
+			underlyingTransport: httpClient,
+		}
 	}
 
 	c := client.New(cr, strfmt.Default)
@@ -155,6 +181,7 @@ func Execute() {
 	app.Flag("output", "Output formatter (simple, extended, json)").Short('o').Default("simple").EnumVar(&output, "simple", "extended", "json")
 	app.Flag("timeout", "Timeout for the executed command").Default("30s").DurationVar(&timeout)
 	app.Flag("http.config.file", "HTTP client configuration file for amtool to connect to Alertmanager.").PlaceHolder("<filename>").ExistingFileVar(&httpConfigFile)
+	app.Flag("global-http-param", "A global key=value parameter to include in all HTTP requests.").PlaceHolder("key=value").StringMapVar(&globalHttpParams)
 	app.Flag("version-check", "Check alertmanager version. Use --no-version-check to disable.").Default("true").BoolVar(&versionCheck)
 	app.Flag("enable-feature", fmt.Sprintf("Experimental features to enable, comma separated. Valid options: %s", strings.Join(featurecontrol.AllowedFlags, ", "))).Default("").StringVar(&featureFlags)
 
